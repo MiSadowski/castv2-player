@@ -184,6 +184,69 @@ test("load error: volume restored and the error passed on", async (t) => {
   assert.equal(result.error.message, "load failed");
 });
 
+test("restore waits for the reply to the announcement volume request", async (t) => {
+  const { client, player } = setup(t);
+  let releaseFirst;
+  const original = client.setVolumePromise.bind(client);
+  client.setVolumePromise = (volume, force) => {
+    const reply = original(volume, force);
+    if (client.calls.length > 1) return reply;
+    return new Promise((resolve) => { releaseFirst = () => resolve(reply); });   // first reply is late
+  };
+  player.playUrl = () => Promise.reject(new Error("load failed"));
+  const result = track(player.playAnnouncementPromise(announcement(55)));
+  await flush();
+  assert.deepEqual(client.calls, [[55, true]], "restore must not be sent before the first reply");
+  assert.equal(result.settled, false);
+  releaseFirst();
+  await flush();
+  assert.deepEqual(client.calls, [[55, true], [20, true]]);
+  assert.equal(result.error.message, "load failed");
+});
+
+test("device drops the restore request: sent again until the reply matches", async (t) => {
+  const { client, player, status, playing } = setup(t);
+  let dropped = 0;
+  client.setVolumePromise = (volume, force) => {
+    client.calls.push([volume, !!force]);
+    if (volume === 20 && dropped < 1) { dropped++; return Promise.resolve(client.device); }  // ignored, replies old volume
+    client.device = volume;
+    return Promise.resolve(volume);
+  };
+  const result = track(player.playAnnouncementPromise(announcement(55)));
+  await flush();
+  playing();
+  status("IDLE");
+  await flush();
+  assert.deepEqual(client.calls, [[55, true], [20, true]]);
+  assert.equal(result.settled, false, "not finished before the volume is confirmed");
+  t.mock.timers.tick(299);
+  await flush();
+  assert.equal(client.calls.length, 2, "one millisecond too early for the retry");
+  t.mock.timers.tick(1);
+  await flush();
+  assert.deepEqual(client.calls, [[55, true], [20, true], [20, true]]);
+  assert.equal(client.device, 20);
+  assert.equal(result.settled, true);
+});
+
+test("device never takes the restore: gives up after 3 requests and still finishes", async (t) => {
+  const { client, player, status, playing } = setup(t);
+  client.setVolumePromise = (volume, force) => {
+    client.calls.push([volume, !!force]);
+    if (volume === 55) client.device = 55;
+    return Promise.resolve(client.device);
+  };
+  const result = track(player.playAnnouncementPromise(announcement(55)));
+  await flush();
+  playing();
+  status("IDLE");
+  for (let i = 0; i < 5; i++) { await flush(); t.mock.timers.tick(300); }
+  await flush();
+  assert.deepEqual(client.calls, [[55, true], [20, true], [20, true], [20, true]]);
+  assert.equal(result.settled, true);
+});
+
 test("second announcement waits and never takes the announcement volume as original", async (t) => {
   const { client, player, loads, status, playing } = setup(t, { device: 20 });
   const url2 = "http://host/tts.mp3?ts=2";
