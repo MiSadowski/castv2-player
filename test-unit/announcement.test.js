@@ -328,3 +328,73 @@ test("client: forced volume is sent even if the cache already shows it", async (
   await client.setVolumePromise(30);
   assert.deepEqual(sent, [20, 30]);
 });
+
+// --- closing the connection ---------------------------------------------------------
+// A Client double with the shape of castv2-client's PlatformSender: "client" is the castv2
+// connection, which holds the socket. The device dropping the connection is replayed the way
+// the two libraries do it: castv2 sets socket to null, castv2-client then sets client to null,
+// and only after that the "close" listener of PersistentClient runs.
+function closeSetup() {
+  const client = new PersistentClient({ host: "h", name: "n", port: 1 });
+  const calls = [];
+  const socket = { destroy() { calls.push("socket.destroy"); } };
+  const sender = new EventEmitter();
+  sender.client = { socket };
+  sender.close = () => { calls.push("sender.close"); };
+  client._connecting_client = undefined;
+  client._client = sender;
+  let disconnected = 0;
+  client.on(client.EVENT_DISCONNECTED, () => disconnected++);
+  logLines.length = 0;
+  return { client, sender, calls, disconnected: () => disconnected };
+}
+const errorsLogged = () => logLines.filter(([level]) => level === "error").map(([, text]) => text);
+
+test("close: a live connection is closed, socket first", () => {
+  const { client, calls, disconnected } = closeSetup();
+  client._close();
+  assert.deepEqual(calls, ["socket.destroy", "sender.close"]);
+  assert.deepEqual(errorsLogged(), []);
+  assert.equal(disconnected(), 1);
+  assert.equal(client._client, undefined);
+});
+
+test("close: connection already released by the device -> no error, still disconnected", () => {
+  const { client, sender, calls, disconnected } = closeSetup();
+  sender.client.socket = null;
+  sender.client = null;
+  client._close();
+  assert.deepEqual(calls, [], "nothing is closed twice");
+  assert.deepEqual(errorsLogged(), [], "no 'Error disconnecting' line");
+  assert.ok(logLines.some(([level, text]) => level === "debug" && /already closed/.test(text)), "noted at debug level");
+  assert.equal(disconnected(), 1, "the disconnect event still fires, so the player notices");
+  assert.equal(client._client, undefined, "and the client is cleared for the reconnect");
+  assert.equal(client._status, undefined);
+});
+
+test("close: connection object left but its socket gone -> no error", () => {
+  const { client, sender, calls, disconnected } = closeSetup();
+  sender.client.socket = null;
+  client._close();
+  assert.deepEqual(calls, []);
+  assert.deepEqual(errorsLogged(), []);
+  assert.equal(disconnected(), 1);
+});
+
+test("close: an unexpected failure while closing is still logged as an error", () => {
+  const { client, sender, disconnected } = closeSetup();
+  sender.close = () => { throw new Error("boom"); };
+  client._close();
+  assert.equal(errorsLogged().length, 1);
+  assert.match(errorsLogged()[0], /Error disconnecting.*boom/);
+  assert.equal(disconnected(), 1);
+});
+
+test("close: nothing connected -> nothing happens", () => {
+  const { client, calls, disconnected } = closeSetup();
+  client._client = undefined;
+  client._close();
+  assert.deepEqual(calls, []);
+  assert.deepEqual(errorsLogged(), []);
+  assert.equal(disconnected(), 0);
+});
